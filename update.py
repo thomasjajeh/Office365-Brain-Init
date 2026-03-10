@@ -1,8 +1,9 @@
 import os
 import time
 from datetime import datetime, timedelta, timezone
-import requests
+
 import msal
+import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
@@ -28,18 +29,17 @@ SEARCH_INDEX = "agent-brain"
 
 TARGET_MAILBOX = os.getenv("TARGET_MAILBOX")
 
-LOOKBACK_MINUTES = 5
+LOOKBACK_MINUTES = 10
 
 # ---------------------------
 # AUTHENTICATE GRAPH
 # ---------------------------
 
+
 def get_graph_token():
     authority = f"https://login.microsoftonline.com/{TENANT_ID}"
     app = msal.ConfidentialClientApplication(
-        CLIENT_ID,
-        authority=authority,
-        client_credential=CLIENT_SECRET
+        CLIENT_ID, authority=authority, client_credential=CLIENT_SECRET
     )
     token = app.acquire_token_for_client(scopes=GRAPH_SCOPE)
     if "access_token" not in token:
@@ -51,6 +51,7 @@ def get_graph_token():
 # CLEAN EMAIL HTML
 # ---------------------------
 
+
 def clean_html(html):
     soup = BeautifulSoup(html, "html.parser")
     return soup.get_text(separator=" ")
@@ -60,11 +61,12 @@ def clean_html(html):
 # CHUNK TEXT
 # ---------------------------
 
+
 def chunk_text(text, chunk_size=300):
     words = text.split()
     chunks = []
     for i in range(0, len(words), chunk_size):
-        chunk = " ".join(words[i:i + chunk_size])
+        chunk = " ".join(words[i : i + chunk_size])
         chunks.append(chunk)
     return chunks
 
@@ -73,16 +75,14 @@ def chunk_text(text, chunk_size=300):
 # GENERATE EMBEDDING
 # ---------------------------
 
+
 def create_embedding(text):
     words = text.split()
     if len(words) > 6000:
         text = " ".join(words[:6000])
 
     url = f"{OPENAI_ENDPOINT}/openai/deployments/{EMBED_MODEL}/embeddings?api-version=2024-02-01"
-    headers = {
-        "api-key": OPENAI_KEY,
-        "Content-Type": "application/json"
-    }
+    headers = {"api-key": OPENAI_KEY, "Content-Type": "application/json"}
     payload = {"input": text}
 
     for attempt in range(5):
@@ -95,7 +95,7 @@ def create_embedding(text):
             time.sleep(wait)
         elif "maximum context length" in response.text:
             words = text.split()
-            text = " ".join(words[:len(words) // 2])
+            text = " ".join(words[: len(words) // 2])
             payload["input"] = text
             print(f"Chunk too large, truncating to {len(words) // 2} words...")
         else:
@@ -108,9 +108,12 @@ def create_embedding(text):
 # FETCH RECENT EMAILS
 # ---------------------------
 
+
 def get_recent_emails(token, folder="inbox"):
     """Fetch emails received in the last LOOKBACK_MINUTES minutes."""
-    since = (datetime.now(timezone.utc) - timedelta(minutes=LOOKBACK_MINUTES)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    since = (datetime.now(timezone.utc) - timedelta(minutes=LOOKBACK_MINUTES)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
     filter_query = f"receivedDateTime ge {since}"
 
     url = (
@@ -135,6 +138,7 @@ def get_recent_emails(token, folder="inbox"):
 # PREPARE DOCUMENTS
 # ---------------------------
 
+
 def build_documents(email):
     body = clean_html(email["body"]["content"])
     chunks = chunk_text(body)
@@ -151,7 +155,7 @@ def build_documents(email):
             "sender": email.get("from", {}).get("emailAddress", {}).get("address", ""),
             "date": email.get("receivedDateTime", ""),
             "content_chunk": chunk,
-            "content_vector": embedding
+            "content_vector": embedding,
         }
         docs.append(doc)
 
@@ -162,15 +166,11 @@ def build_documents(email):
 # UPLOAD TO AZURE SEARCH
 # ---------------------------
 
+
 def upload_batch(documents):
     url = f"{SEARCH_ENDPOINT}/indexes/{SEARCH_INDEX}/docs/index?api-version=2024-07-01"
-    headers = {
-        "Content-Type": "application/json",
-        "api-key": SEARCH_KEY
-    }
-    payload = {
-        "value": [{"@search.action": "upload", **doc} for doc in documents]
-    }
+    headers = {"Content-Type": "application/json", "api-key": SEARCH_KEY}
+    payload = {"value": [{"@search.action": "upload", **doc} for doc in documents]}
     r = requests.post(url, headers=headers, json=payload)
     if r.status_code not in [200, 201]:
         print("Upload error:", r.text)
@@ -179,6 +179,7 @@ def upload_batch(documents):
 # ---------------------------
 # MAIN
 # ---------------------------
+
 
 def run():
     print(f"Fetching emails from the last {LOOKBACK_MINUTES} minutes...")
