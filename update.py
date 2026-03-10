@@ -1,5 +1,6 @@
 import os
 import time
+from datetime import datetime, timedelta, timezone
 import requests
 import msal
 from bs4 import BeautifulSoup
@@ -27,28 +28,22 @@ SEARCH_INDEX = "agent-brain"
 
 TARGET_MAILBOX = os.getenv("TARGET_MAILBOX")
 
-BATCH_SIZE = 100
-PAGE_DELAY = 2  # seconds to wait between Graph API pages
+LOOKBACK_MINUTES = 5
 
 # ---------------------------
 # AUTHENTICATE GRAPH
 # ---------------------------
 
 def get_graph_token():
-
     authority = f"https://login.microsoftonline.com/{TENANT_ID}"
-
     app = msal.ConfidentialClientApplication(
         CLIENT_ID,
         authority=authority,
         client_credential=CLIENT_SECRET
     )
-
     token = app.acquire_token_for_client(scopes=GRAPH_SCOPE)
-
     if "access_token" not in token:
         raise Exception(f"Graph auth failed: {token}")
-
     return token["access_token"]
 
 
@@ -57,11 +52,8 @@ def get_graph_token():
 # ---------------------------
 
 def clean_html(html):
-
     soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text(separator=" ")
-
-    return text
+    return soup.get_text(separator=" ")
 
 
 # ---------------------------
@@ -69,14 +61,11 @@ def clean_html(html):
 # ---------------------------
 
 def chunk_text(text, chunk_size=300):
-
     words = text.split()
     chunks = []
-
     for i in range(0, len(words), chunk_size):
         chunk = " ".join(words[i:i + chunk_size])
         chunks.append(chunk)
-
     return chunks
 
 
@@ -85,35 +74,26 @@ def chunk_text(text, chunk_size=300):
 # ---------------------------
 
 def create_embedding(text):
-
-    # Truncate to ~6000 words to stay under 8192 token limit
     words = text.split()
     if len(words) > 6000:
         text = " ".join(words[:6000])
 
     url = f"{OPENAI_ENDPOINT}/openai/deployments/{EMBED_MODEL}/embeddings?api-version=2024-02-01"
-
     headers = {
         "api-key": OPENAI_KEY,
         "Content-Type": "application/json"
     }
-
-    payload = {
-        "input": text
-    }
+    payload = {"input": text}
 
     for attempt in range(5):
         response = requests.post(url, headers=headers, json=payload)
-
         if response.status_code == 200:
             return response.json()["data"][0]["embedding"]
-
         if response.status_code == 429:
             wait = 15 * (attempt + 1)
             print(f"Rate limited, waiting {wait}s...")
             time.sleep(wait)
         elif "maximum context length" in response.text:
-            # Chunk too large for model, truncate and retry
             words = text.split()
             text = " ".join(words[:len(words) // 2])
             payload["input"] = text
@@ -125,34 +105,30 @@ def create_embedding(text):
 
 
 # ---------------------------
-# FETCH EMAILS FROM GRAPH
+# FETCH RECENT EMAILS
 # ---------------------------
 
-def get_email_pages(token, folder="inbox"):
-    """Yields one page of emails at a time from Graph API."""
+def get_recent_emails(token, folder="inbox"):
+    """Fetch emails received in the last LOOKBACK_MINUTES minutes."""
+    since = (datetime.now(timezone.utc) - timedelta(minutes=LOOKBACK_MINUTES)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    filter_query = f"receivedDateTime ge {since}"
 
-    url = f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}/mailFolders/{folder}/messages?$top=50&$select=id,subject,body,from,receivedDateTime,conversationId"
+    url = (
+        f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}/mailFolders/{folder}/messages"
+        f"?$top=50&$filter={filter_query}"
+        f"&$select=id,subject,body,from,receivedDateTime,conversationId"
+        f"&$orderby=receivedDateTime desc"
+    )
 
-    headers = {
-        "Authorization": f"Bearer {token}"
-    }
-
-    page_num = 0
+    headers = {"Authorization": f"Bearer {token}"}
+    emails = []
 
     while url:
-
         r = requests.get(url, headers=headers).json()
-
-        page = r.get("value", [])
-        page_num += 1
-
-        if page:
-            yield page
-
+        emails.extend(r.get("value", []))
         url = r.get("@odata.nextLink")
 
-        if url:
-            time.sleep(PAGE_DELAY)
+    return emails
 
 
 # ---------------------------
@@ -160,17 +136,12 @@ def get_email_pages(token, folder="inbox"):
 # ---------------------------
 
 def build_documents(email):
-
     body = clean_html(email["body"]["content"])
-
     chunks = chunk_text(body)
-
     docs = []
 
     for i, chunk in enumerate(chunks):
-
         embedding = create_embedding(chunk)
-
         doc = {
             "id": f"{email['id']}_{i}",
             "source": "mailbox",
@@ -182,7 +153,6 @@ def build_documents(email):
             "content_chunk": chunk,
             "content_vector": embedding
         }
-
         docs.append(doc)
 
     return docs
@@ -193,69 +163,53 @@ def build_documents(email):
 # ---------------------------
 
 def upload_batch(documents):
-
     url = f"{SEARCH_ENDPOINT}/indexes/{SEARCH_INDEX}/docs/index?api-version=2024-07-01"
-
     headers = {
         "Content-Type": "application/json",
         "api-key": SEARCH_KEY
     }
-
     payload = {
-        "value": [
-            {"@search.action": "upload", **doc} for doc in documents
-        ]
+        "value": [{"@search.action": "upload", **doc} for doc in documents]
     }
-
     r = requests.post(url, headers=headers, json=payload)
-
     if r.status_code not in [200, 201]:
         print("Upload error:", r.text)
 
 
 # ---------------------------
-# MAIN PIPELINE
+# MAIN
 # ---------------------------
 
 def run():
-
-    print("Authenticating to Graph...")
+    print(f"Fetching emails from the last {LOOKBACK_MINUTES} minutes...")
     token = get_graph_token()
 
     all_docs = []
-    total_emails = 0
+    total = 0
     skipped = 0
 
     for folder in ["inbox", "archive"]:
-        print(f"\n--- Processing {folder} ---")
-        page_num = 0
+        emails = get_recent_emails(token, folder=folder)
+        print(f"  {folder}: {len(emails)} new emails")
 
-        for page in get_email_pages(token, folder=folder):
-            page_num += 1
-            print(f"\nPage {page_num} ({len(page)} emails)")
-
-            for email in page:
-                total_emails += 1
-                subject = email.get('subject', '(no subject)')
-                print(f"  [{total_emails}] {subject}")
-
-                try:
-                    docs = build_documents(email)
-                    all_docs.extend(docs)
-
-                    if len(all_docs) >= BATCH_SIZE:
-                        upload_batch(all_docs)
-                        print(f"  Uploaded {len(all_docs)} chunks")
-                        all_docs = []
-                except Exception as e:
-                    skipped += 1
-                    print(f"  SKIPPED [{total_emails}] {subject} — Error: {e}")
+        for email in emails:
+            total += 1
+            subject = email.get("subject", "(no subject)")
+            try:
+                docs = build_documents(email)
+                all_docs.extend(docs)
+            except Exception as e:
+                skipped += 1
+                print(f"  SKIPPED: {subject} — {e}")
 
     if all_docs:
         upload_batch(all_docs)
-        print(f"Uploaded final {len(all_docs)} chunks")
+        print(f"Uploaded {len(all_docs)} chunks from {total} emails")
+    else:
+        print("No new emails to process.")
 
-    print(f"\nFinished ingestion! Total emails processed: {total_emails}, Skipped: {skipped}")
+    if skipped:
+        print(f"Skipped: {skipped}")
 
 
 if __name__ == "__main__":
